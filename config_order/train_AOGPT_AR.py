@@ -6,29 +6,44 @@
 n_layer = 12
 n_head = 12
 n_embd = 768
+model_type = 'AdaLN6_NoRep_cond_128_trunc_qknorm'
 
 # I/O
-out_dir = '124M'
+out_dir = 'order_ckpt/124M-AR'
 wandb_log = True
-wandb_project = 'CADD'
-wandb_run_name= 'CADD-124M'
+wandb_project = 'AOGPT'
+wandb_run_name= 'AOGPT-124M-AR'
+
+# Bias
+bias = True
+
+# Dropout
+dropout = 0.0
+
+# EMA
+ema_rate = 1 - 1e-4
+
+# weight decay
+weight_decay = 5e-2
+
+# beta2
+beta2 = 0.95
 
 # these make the total batch size be ~0.5M
-# 16 batch size * 1024 block size * 4 gradaccum * 8 GPUs = 524,288
-batch_size = 16
+# 32 batch size * 1024 block size * 2 gradaccum * 8 GPUs = 524,288
+batch_size = 32
 block_size = 1024
-gradient_accumulation_steps = 4*8
+gradient_accumulation_steps = 2*8
 
 # this makes total number of tokens be 500B
 learning_rate = 6e-4
-max_iters = 1000000
-lr_decay_iters = 1000000
+max_iters = 20000
+lr_decay_iters = 500000
 
 # eval stuff
-eval_interval = 5000
+eval_interval = 1000
 save_interval = 10000
 eval_iters = 96
 log_interval = 10
 
-# weight decay
-weight_decay = 1e-1
+

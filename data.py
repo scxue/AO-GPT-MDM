@@ -118,17 +118,17 @@ def get_lambada_test_dataset():
 
 def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
     if name == "wikitext103":
-        dataset = load_dataset("/root/autodl-tmp/data/wikitext", name="wikitext-103-raw-v1", cache_dir=cache_dir, num_proc=num_proc)
+        dataset = load_dataset("Salesforce/wikitext", name="wikitext-103-raw-v1", cache_dir=cache_dir, num_proc=num_proc)
     elif name == "wikitext2":
-        dataset = load_dataset("/root/autodl-tmp/data/wikitext", name="wikitext-2-raw-v1", cache_dir=cache_dir, num_proc=num_proc)
+        dataset = load_dataset("Salesforce/wikitext", name="wikitext-2-raw-v1", cache_dir=cache_dir, num_proc=num_proc)
     elif name == "ptb":
-        dataset = load_dataset("/root/autodl-tmp/data/ptb_text_only", cache_dir=cache_dir, num_proc=num_proc)
+        dataset = load_dataset("ptb-text-only/ptb_text_only", cache_dir=cache_dir, num_proc=num_proc)
     elif name == "lambada":
         dataset = get_lambada_test_dataset()
     elif name == "lm1b":
-        dataset = load_dataset("/root/autodl-tmp/data/lm1b", cache_dir=cache_dir, num_proc=num_proc)
+        dataset = load_dataset("dvruette/lm1b", cache_dir=cache_dir, num_proc=num_proc)
     elif name == 'openwebtext':
-        dataset = load_dataset("/root/autodl-tmp/data/openwebtext", cache_dir=cache_dir, num_proc=num_proc)
+        dataset = load_dataset("Skylion007/openwebtext", cache_dir=cache_dir, num_proc=num_proc)
     else:
         dataset = load_dataset(name, cache_dir=cache_dir, num_proc=num_proc)
 
@@ -155,7 +155,7 @@ def get_dataset(name, mode, cache_dir=None, block_size=1024, num_proc=8):
             return text
         return detok
 
-    tokenizer = GPT2TokenizerFast.from_pretrained('/root/autodl-tmp/model/gpt2')
+    tokenizer = GPT2TokenizerFast.from_pretrained('openai-community/gpt2-large') # load from local or directly from hf
     EOS = tokenizer.encode(tokenizer.eos_token)[0]
 
     def preprocess_and_tokenize(example):

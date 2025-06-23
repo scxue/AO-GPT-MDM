@@ -16,16 +16,20 @@ import torch.nn as nn
 from torch.nn import functional as F
 import random
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+def modulate(x, shift, scale):
+    return x * (1 + scale) + shift
 
-    def __init__(self, ndim, bias):
+class RMSNorm(nn.Module):
+    def __init__(self, ndim):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.rms_norm(input, self.weight.shape, self.weight, 1e-5)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -37,11 +41,13 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
+        self.attn_dropout = nn.Dropout(0.)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.q_norm = RMSNorm(self.n_embd // self.n_head)
+        self.k_norm = RMSNorm(self.n_embd // self.n_head)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -58,11 +64,12 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k = self.q_norm(q), self.k_norm(k)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0, is_causal=True)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -96,18 +103,37 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(128, 6 * config.n_embd, bias=True)
+        )
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.adaLN(c)).chunk(6, dim=-1)
+        x = x + gate_msa * self.attn(modulate(self.ln_1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.ln_2(x), shift_mlp, scale_mlp))
+        return x
+
+class FinalLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_f = RMSNorm(config.n_embd)
+        self.adaLN_final = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(128, 2 * config.n_embd, bias=True)
+        )
+    
+    def forward(self, x, c):
+        shift, scale = (self.adaLN_final(c)).chunk(2, dim=-1)
+        x = modulate(self.ln_f(x), shift, scale)
         return x
 
 @dataclass
-class CADDConfig:
+class AOGPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -116,7 +142,7 @@ class CADDConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
-class CADD(nn.Module):
+class AOGPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -128,25 +154,20 @@ class CADD(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size + 1, config.n_embd),  # + 1 to handle additional [None] token for unconditional generation
-            wtpe = nn.Embedding(config.block_size, config.n_embd),     # [None] is not target
+            wtpe = nn.Embedding(config.block_size, 128),     # [None] is not target   
             wnonee = nn.Embedding(1, config.n_embd),                   # embedding for [None] token
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            final_layer = FinalLayer(config),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=True)
 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.trunc_normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer), a=-3*0.02/math.sqrt(2 * config.n_layer), b=3*0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -165,11 +186,11 @@ class CADD(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-3*0.02, b=3*0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02, a=-3*0.02, b=3*0.02)
     
     # From rar https://github.com/bytedance/1d-tokenizer/blob/main/modeling/rar.py#L266
     def sample_random_orders(self, x):
@@ -181,6 +202,19 @@ class CADD(nn.Module):
             # random order
             shuffled_orders.append(torch.randperm(seq_length, device=x.device))
                 
+        shuffled_orders = torch.stack(shuffled_orders)
+        return shuffled_orders.to(x.device)
+
+    def sample_random_orders_CL(self, x, random_ratio):
+        batch_size = x.shape[0]
+        seq_length = x.shape[1]
+        shuffled_orders = []
+
+        for _ in range(batch_size):
+            if random.random() < random_ratio:
+                shuffled_orders.append(torch.randperm(seq_length, device=x.device))
+            else:
+                shuffled_orders.append(torch.arange(seq_length, device=x.device))
         shuffled_orders = torch.stack(shuffled_orders)
         return shuffled_orders.to(x.device)
 
@@ -212,11 +246,11 @@ class CADD(nn.Module):
         unshuffled_x[batch_indices, orders] = shuffled_x
         return unshuffled_x
     
-    def forward(self, idx, mode='Random', order=None):
+    def forward(self, idx, mode='Random', orders=None, random_ratio=None):
         if mode is None:
-            assert order is not None and idx.shape==order.shape, 'mode is None, order should be given and with the same shape of idx'
+            assert orders is not None and idx.shape==orders.shape, 'mode is None, order should be given and with the same shape of idx'
         else:
-            assert mode in ['AR', 'Random'], 'mode should be AR or Random'
+            assert mode in ['AR', 'Random', 'Random_CL'], 'mode should be AR or Random or Random_CL'
         
         if mode is None:
             return self.forward_fn(idx, orders)
@@ -227,7 +261,11 @@ class CADD(nn.Module):
         elif mode == 'Random':
             # get random orders
             orders = self.sample_random_orders(idx)   
-            return self.forward_fn(idx, orders)         
+            return self.forward_fn(idx, orders)
+        elif mode == 'Random_CL':
+            assert random_ratio is not None
+            orders = self.sample_random_orders_CL(idx, random_ratio)
+            return self.forward_fn(idx, orders)     
 
 
     def forward_fn(self, idx, orders):
@@ -253,15 +291,16 @@ class CADD(nn.Module):
         target_pos_emb = self.transformer.wtpe(pos[:t]) # target position embeddings of shape (t, n_embd)
         target_pos_emb = target_pos_emb.unsqueeze(0).expand(idx.shape[0], -1, -1) # expand to shape (b, t, n_embd)
         target_pos_emb_prefix = self.shuffle(target_pos_emb, orders) # shuffle target position embeddings of shape (b, t, n_embd)
-        target_pos_emb_postfix = torch.zeros_like(tok_emb[:, :1]) # zeros of shape (b, 1, n_embd)
+        target_pos_emb_postfix = torch.zeros_like(target_pos_emb[:, :1]) # zeros of shape (b, 1, n_embd)
+        target_pos_emb_final = torch.cat([target_pos_emb_prefix, target_pos_emb_postfix], dim = 1)
         
-        x = tok_emb + torch.cat([pos_emb_prefix, pos_emb_postfix], dim=1) + torch.cat([target_pos_emb_prefix, target_pos_emb_postfix], dim = 1)
+        x = tok_emb + torch.cat([pos_emb_prefix, pos_emb_postfix], dim=1)
         
         # forward the GPT model itself
         x = self.transformer.drop(x)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x, target_pos_emb_final)
+        x = self.transformer.final_layer(x, target_pos_emb_final)
 
 
         # if we are given some desired targets also calculate the loss

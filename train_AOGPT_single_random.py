@@ -28,8 +28,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
-
-from model_CADD import CADDConfig, CADD
+from ema import ExponentialMovingAverage
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -51,7 +50,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 train_dataset = 'openwebtext'
 valid_dataset = 'wikitext103'
 val_dataset_list = ['wikitext2', 'wikitext103', 'ptb', 'lambada']
-cache_dir = '/root/autodl-tmp/cache'
+cache_dir = '/home/cache'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -61,6 +60,9 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+model_type = None
+# EMA
+ema_rate = 1-1e-4
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -79,11 +81,18 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+order = None
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+
+if model_type == 'AdaLN6_NoRep_cond_128_trunc_qknorm':
+    from model_AOGPT_AdaLN6_NoRep_cond_128_trunc_qknorm import AOGPT, AOGPTConfig
+else:
+    raise NotImplementedError(f"Model Type {model_type} is not supported")
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -120,8 +129,12 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+order = torch.tensor(order)
+orders = torch.tile(order, (batch_size, 1)).to(device)
+
+
 # Torch Train and Val Dataloader
-train_loader, val_loader = data.get_dataloaders(train_dataset=train_dataset, valid_dataset=valid_dataset, batch_size=batch_size, cache_dir=cache_dir, block_size=block_size, distributed=ddp, n_proc=128)
+train_loader, val_loader = data.get_dataloaders(train_dataset=train_dataset, valid_dataset=valid_dataset, batch_size=batch_size, cache_dir=cache_dir, block_size=block_size, distributed=ddp, n_proc=64)
 train_iter, val_iter = iter(train_loader), iter(val_loader)
 def get_batch(split):
     if split == 'train':
@@ -177,8 +190,8 @@ if init_from == 'scratch':
     # determine the vocab size we'll use for from-scratch training
     print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = 50304
-    caddconf = CADDConfig(**model_args)
-    model = CADD(caddconf)
+    AOGPTconf = AOGPTConfig(**model_args)
+    model = AOGPT(AOGPTconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -190,8 +203,8 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    caddconf = CADDConfig(**model_args)
-    model = CADD(caddconf)
+    AOGPTconf = AOGPTConfig(**model_args)
+    model = AOGPT(AOGPTconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -226,6 +239,11 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+    
+# create ema copy of model
+ema = ExponentialMovingAverage(
+    model.parameters(), decay=ema_rate)
+print(f"EMA: {ema_rate}")
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 def estimate_loss_AR():
@@ -235,7 +253,7 @@ def estimate_loss_AR():
         for k in range(eval_iters):
             X = get_batch(split)
             with ctx:
-                _, loss = model(X, mode='AR')
+                _, loss = model(X, orders=orders)
             total_loss += loss
         dist.all_reduce(total_loss)
         total_loss /= eval_iters
@@ -270,7 +288,7 @@ def estimate_PPL_AR():
         batch_num = 0
         for batch in ppl_eval_iter:
             batch = batch['input_ids'].to(device)
-            _, cur_loss = model(batch, mode='AR')
+            _, cur_loss = model(batch, orders=orders)
             total_loss += cur_loss
             batch_num += 1
         dist.all_reduce(total_loss)
@@ -343,6 +361,8 @@ while True:
     if iter_num > 0 and iter_num % eval_interval == 0:
         model.eval()
         with torch.no_grad():
+            ema.store(model.parameters())
+            ema.copy_to(model.parameters())
             AR_losses = estimate_loss_AR()
             if master_process:
                 print(f"AR Likelihood: step {iter_num}: train loss {AR_losses['train']:.4f}, val loss {AR_losses['val']:.4f}")
@@ -356,6 +376,7 @@ while True:
                 print('Start Evaluate Random PPL')
             # Estimate Random PPL    
             estimate_PPL_Random()
+            ema.restore(model.parameters())
         model.train()
         if wandb_log and master_process:
             wandb_log_dic = {
@@ -367,13 +388,15 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
-            AR_val_ppl_dic = {k: AR_ppl_dic[k] for k in val_dataset_list}
-            Random_val_ppl_dic = {k: Random_ppl_dic[k] for k in val_dataset_list}
+            AR_val_ppl_dic = {f'{k}_AR': AR_ppl_dic[k] for k in val_dataset_list}
+            Random_val_ppl_dic = {f'{k}_Random': Random_ppl_dic[k] for k in val_dataset_list}
             wandb.log({**wandb_log_dic, **AR_val_ppl_dic, **Random_val_ppl_dic})
 
         if iter_num > 0 and iter_num % save_interval == 0 and master_process:
             checkpoint = {
                 'model': raw_model.state_dict(),
+                'ema_model': ema.state_dict(),
+                'ema_rate': ema_rate,
                 'optimizer': optimizer.state_dict(),
                 'model_args': model_args,
                 'iter_num': iter_num,
@@ -394,7 +417,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X)
+            logits, loss = model(X, orders=orders)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X = get_batch('train')
@@ -408,6 +431,7 @@ while True:
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
+    ema.update(model.parameters())
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -430,4 +454,5 @@ while True:
         break
 
 if ddp:
+    dist.barrier()
     destroy_process_group()
